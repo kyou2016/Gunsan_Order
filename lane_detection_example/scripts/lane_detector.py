@@ -6,39 +6,42 @@ import cv2
 import os, rospkg
 import numpy as np
 import json
+import copy
 
 from sensor_msgs.msg import CompressedImage
+from cv_bridge import CvBridgeError
 
-from utils import BEVTransform, CURVEFit, draw_lane_img
+from utils_copy import BEVTransform, CURVEFit, draw_lane_img, purePursuit, PID_longitudinal
 
 class LINEDetector:
 
     def __init__(self):
-        self.img_lane = None
-	self.cam = None
 	self.set_cam(1)
 
-    def set_cam(self, _index):
+    def set_cam(self,_index):
 	self.cam = cv2.VideoCapture(int(_index))
 
-    def get_cam_image(self):
-	ret, img = self.cam.read()
-	return ret, img
+    def get_image(self):
+	ret, img_lane = self.cam.read()
+	return ret, img_lane
 
-    def binary_image(self):
-        ret, img_bgr = self.get_cam_image()
+    def get_bi_img(self):
+	ret, img_bgr = self.get_image()
+	img = copy.deepcopy(img_bgr)
+	img2 = copy.deepcopy(img_bgr)
+	img[:int(0.5*480), :] = 0
+	img2[:int(0.5*480), :] = 0
 
-        img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+	self.outimg = np.concatenate([img, img2], axis=1)
 
-        # 주황색 차선, 흰색 차선 모두 검출되는 값 -> 실제 사용시 다른 값이 검출될 수 있음
-        upper_lane = np.array([37, 255, 255])
-        lower_lane = np.array([ 0,   0, 250])
+	img_hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
 
-        self.img_lane = cv2.inRange(img_hsv, lower_lane, upper_lane)
-	
-	return self.img_lane
-        # self.img_lane = cv2.cvtColor(self.img_lane, cv2.COLOR_GRAY2BGR)
+	lower_lane = np.array([ 0,   0, 194]) # 0,   0, 250  0  0 220
+	upper_lane = np.array([37, 35, 255]) # 37, 255, 255 40 10 255
 
+	img_wlane = cv2.inRange(img_hsv, lower_lane, upper_lane)
+
+	return img_wlane
 
 if __name__ == '__main__':
     rp = rospkg.RosPack()
@@ -46,7 +49,7 @@ if __name__ == '__main__':
     currentPath = rp.get_path("lane_detection_example")
 
     # WeCar의 카메라의 파라미터 값을 적어놓은 json파일을 읽어와서 params_cam으로 저장
-    with open(os.path.join(currentPath, 'sensor/sensor_params.json'), 'r') as fp:
+    with open(os.path.join(currentPath, 'sensor/sensor_params_LG.json'), 'r') as fp:
         sensor_params = json.load(fp)
 
     params_cam = sensor_params["params_cam"]
@@ -54,22 +57,23 @@ if __name__ == '__main__':
     rospy.init_node('Line_Detector', anonymous=True)
 
     # WeCar의 카메라 이미지를 Bird Eye View 이미지로 변환하기 위한 클래스를 선언
-    bev_trans = BEVTransform(params_cam=params_cam)
+    bev_trans = BEVTransform(params_cam=params_cam,cut_size=0.5)
     # BEV로 변환된 이미지에서 추출한 포인트를 기반으로 RANSAC을 이용하여 차선을 예측하는 클래스를 선언
-    pts_learner = CURVEFit(order=3)
+    pts_learner = CURVEFit(order=3, init_width=1.0)
 
     lane_detector = LINEDetector()
 
+    ctrl_onlane = purePursuit(look_forward_distance=1.2)
+    ctrl_speed = PID_longitudinal(speed_max=1000)
+
     rate = rospy.Rate(20)
-    img_wlane = None
 
     while not rospy.is_shutdown():
 
-	if lane_detector.cam is not None:
-	    img_wlane = lane_detector.binary_image()
+        #if lane_detector.img_lane is not None:
+	img_wlane = lane_detector.get_bi_img()
 
-        if img_wlane is not None:
-
+	if img_wlane is not None:
             # 카메라 이미지를 BEV이미지로 변환
             img_bev = bev_trans.warp_bev_img(img_wlane)
             # 카메라 이미지에서 차선에 해당하는 포인트들을 추출
@@ -93,7 +97,17 @@ if __name__ == '__main__':
                                                   xyr[:, 1].astype(np.int32),
                                                   )
             
+            ctrl_speed.calc_vel_cmd()
+            ctrl_onlane.steering_angle()
+
+            if ctrl_onlane.is_path == True:
+		ctrl_speed.pub_speed_cmd()
+                ctrl_onlane.pub_cmd()
+
+
             cv2.imshow('BEV Window', img_bev_line)
-            cv2.waitKey(1)
+            #cv2.imshow('BEV Window', lane_detector.outimg)
+	    #cv2.imshow('test', lane_detector.img2)
+	    cv2.waitKey(1)
 
             rate.sleep()

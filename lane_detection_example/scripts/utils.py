@@ -5,6 +5,7 @@ import rospy
 import numpy as np
 import cv2
 import math
+import copy as cp
 
 from std_msgs.msg import Float64, String
 from nav_msgs.msg import Path
@@ -82,8 +83,8 @@ def projectionMtx(params_cam):
         fc_x = params_cam["HEIGHT"]/(2*np.tan(np.deg2rad(params_cam["FOV"]/2)))
         fc_y = params_cam["HEIGHT"]/(2*np.tan(np.deg2rad(params_cam["FOV"]/2)))
     else:
-        fc_x = params_cam["WIDTH"]/2*(2*np.tan(np.deg2rad(params_cam["FOV"]/2)))
-        fc_y = params_cam["WIDTH"]/2*(2*np.tan(np.deg2rad(params_cam["FOV"]/2)))
+        fc_x = params_cam["WIDTH"]/2(2*np.tan(np.deg2rad(params_cam["FOV"]/2)))
+        fc_y = params_cam["WIDTH"]/2(2*np.tan(np.deg2rad(params_cam["FOV"]/2)))
 
     cx = params_cam['WIDTH']/2
     cy = params_cam["HEIGHT"]/2
@@ -95,9 +96,10 @@ def projectionMtx(params_cam):
 
 class BEVTransform:
 
-    def __init__(self, params_cam, xb=1.0, zb=1.0):
+    def __init__(self, params_cam, xb=1.0, zb=1.0, cut_size=0.5):
         self.xb = xb
         self.zb = zb
+        self.cut_size = cut_size
 
         self.theta = np.deg2rad(params_cam["PITCH"])
         self.width = params_cam["WIDTH"]
@@ -107,34 +109,13 @@ class BEVTransform:
             self.alpha_r = np.deg2rad(params_cam["FOV"]/2)
 
             self.fc_y = params_cam["HEIGHT"]/(2*np.tan(np.deg2rad(params_cam["FOV"]/2)))
-
             self.alpha_c = np.arctan2(params_cam["WIDTH"]/2, self.fc_y)
 
             self.fc_x = self.fc_y
-
-	elif params_cam["ENGINE"]=="LOGITECH":
-            self.fc_y = params_cam["HEIGHT"]/2*3.67
-
-            self.alpha_c = np.arctan2(params_cam["WIDTH"]/2, self.fc_y)
-
-            self.fc_x = self.fc_y
-
-            self.alpha_r = np.arctan2(params_cam["HEIGHT"]/2, self.fc_x)
-
-	elif params_cam["ENGINE"]=="MICROSOFT":
-            self.fc_y = params_cam["HEIGHT"]/2*3.67
-
-            self.alpha_c = np.arctan2(params_cam["WIDTH"]/2, self.fc_y)
-
-            self.fc_x = self.fc_y
-
-            self.alpha_r = np.arctan2(params_cam["HEIGHT"]/2, self.fc_x)
-
         else:
             self.alpha_r = np.deg2rad(params_cam["FOV"]/2)
 
             self.fc_y = params_cam["WIDTH"]/(2*np.tan(np.deg2rad(params_cam["FOV"]/2)))
-
             self.alpha_c = np.arctan2(params_cam["WIDTH"]/2, self.fc_y)
 
             self.fc_x = self.fc_y
@@ -151,14 +132,13 @@ class BEVTransform:
         self.build_tf(params_cam)
 
     def calc_Xv_Yu(self, U, V):
-        Xv = self.h*(np.tan(self.theta)*(1-2*(V-1)/(self.m-1))*np.tan(self.alpha_r)-1)/\
-            (-np.tan(self.theta)+(1-2*(V-1)/(self.m-1))*np.tan(self.alpha_r))
+        Xv = self.h*(np.tan(self.theta)*(1-2*(V-1)/(self.m-1))*np.tan(self.alpha_r)-1)/(-np.tan(self.theta)+(1-2*(V-1)/(self.m-1))*np.tan(self.alpha_r))
         Yu = (1-2*(U-1)/(self.n-1))*Xv*np.tan(self.alpha_c)
 
         return Xv, Yu
 
     def build_tf(self, params_cam):
-        v = np.array([params_cam["HEIGHT"]*0.5, params_cam["HEIGHT"]]).astype(np.float32)
+        v = np.array([params_cam["HEIGHT"]*self.cut_size, params_cam["HEIGHT"]]).astype(np.float32)
         u = np.array([0, params_cam["WIDTH"]]).astype(np.float32)
 
         U, V = np.meshgrid(u, v)
@@ -194,11 +174,12 @@ class BEVTransform:
         return img_warp
 
     def recon_lane_pts(self, img):
-        img[:int(0.5*self.height), :] = 0
+        # cut_size만큼 위에서 이미지를 잘라서 포인트를 추출
+        img[:int(self.cut_size*self.height), :] = 0
 
         if cv2.countNonZero(img) != 0:
             UV_mark = cv2.findNonZero(img).reshape([-1, 2])
-
+            # U는 카메라에서 가로(x) V는 카메라에서 세로(y)
             U, V = UV_mark[:, 0].reshape([-1, 1]), UV_mark[:, 1].reshape([-1, 1])
 
             Xv, Yu = self.calc_Xv_Yu(U, V)
@@ -209,7 +190,7 @@ class BEVTransform:
                 np.zeros_like(Yu.reshape([1, -1])),
                 np.ones_like(Yu.reshape([1, -1]))
             ], axis=0)
-
+            # xyz_g[0]: 추출한 포인터의 x좌표, xyz_g[1]: 추출한 포인터의 y좌표
             xyz_g = xyz_g[:, xyz_g[0, :] >= 0]
         else:
             xyz_g = np.zeros((4, 10))
@@ -263,28 +244,30 @@ class BEVTransform:
 
 class CURVEFit:
 
-    def __init__(self, order):
+    def __init__(self, order, init_width=0.5):
         # order: 다항식 차수, 
-        # land_width: 좌우 차선간의 폭, 
+        # init_width: 초기 좌우 차선간의 폭, 
         # y_margin: 차선 픽셀 좌표를 모을 마진: +,- 0.2, 
         # dx: Regresss가 되면 0.1간격으로 차선을 예측, 
         # min_pts: 모으는 구간당 최소 픽셀 수
         self.order = order
-        self.lane_width = 0.5
         self.y_margin = 0.2
         self.x_range = 3
         self.dx = 0.1
-        self.min_pts = 50
+        self.min_pts = 50        
+        self.init_width = init_width
 
         self.lane_path = Path()
 
         self.ransac_left = linear_model.RANSACRegressor(base_estimator=linear_model.Ridge(alpha=2),
-                                                        max_trials=5,
+                                                        max_trials=5, 
+                                                        #loss='absolute_loss',
                                                         min_samples=self.min_pts, 
                                                         residual_threshold=0.4)
         
         self.ransac_right = linear_model.RANSACRegressor(base_estimator=linear_model.Ridge(alpha=2),
                                                         max_trials=5, 
+                                                        #loss='absolute_loss',
                                                         min_samples=self.min_pts, 
                                                         residual_threshold=0.4)
 
@@ -293,6 +276,7 @@ class CURVEFit:
         self._init_model()
 
     def _init_model(self):
+        self.lane_width = self.init_width
 
         X = np.stack([np.arange(0, 2, 0.02)**i for i in reversed(range(1, self.order+1))]).T
         y_l = 0.5*self.lane_width*np.ones_like(np.arange(0, 2, 0.02))
@@ -302,7 +286,8 @@ class CURVEFit:
         self.ransac_right.fit(X, y_r)
 
     def preprocess_pts(self, lane_pts):
-
+        # recon_lane_pts에서 추출한 포인트들(차선인지 구분 안한 포인트들)을 일정 거리만큼 간격을 주고 랜덤으로 포인트를 선택하여
+        # x_left, x_right, y_left, y_right로 변환
         idx_list = []
         
         for d in np.arange(0, self.x_range, self.dx):
@@ -330,11 +315,26 @@ class CURVEFit:
 
         return x_left, y_left, x_right, y_right
 
-    def fit_curve(self, lane_pts):
-        
+    def fit_curve(self, lane_pts):     
+        self.not_left = False
+        self.not_right = False
+
         x_left, y_left, x_right, y_right = self.preprocess_pts(lane_pts)
 
-        if len(y_left)==0 or len(y_right)==0:
+        # y포인트들(여기서 y값은 가로범위)이 갯수가 0 일경우 초기화
+        if len(y_left) <= 10 or len(y_right) <= 10:
+            if len(y_left) == 0:
+                # print('y_left point does not exist')
+                self.not_left = True
+            else:
+                # print("y_right point does not exist")
+                self.not_right = True
+            self._init_model()
+            x_left, y_left, x_right, y_right = self.preprocess_pts(lane_pts)
+
+        # 차선 폭이 너무 졻게 계산되면 자동으로 초기화
+        if self.lane_width < 0.01:
+            # print("Too Short lane width")
             self._init_model()
             x_left, y_left, x_right, y_right = self.preprocess_pts(lane_pts)
         
@@ -352,15 +352,42 @@ class CURVEFit:
 
         y_pred_l = self.ransac_left.predict(X_pred)
         y_pred_r = self.ransac_right.predict(X_pred)
-
+        
         if y_left.shape[0]>=self.ransac_left.min_samples and y_right.shape[0]>=self.ransac_right.min_samples:
-            self.lane_width = np.mean(y_pred_l - y_pred_r)
+            # if self.lane_width < self.init_width - self.init_width/2:
+            #     # print("Too Short lane width")
+            #     self.lane_width = self.init_width
+            # else:
+            #     self.lane_width = np.mean(y_pred_l - y_pred_r)
+            self.lane_width = np.mean(np.abs(y_pred_l - y_pred_r))
 
         if y_left.shape[0]<self.ransac_left.min_samples:
-            y_pred_l = y_pred_r + self.lane_width
+            y_pred_l = cp.deepcopy(y_pred_r + self.lane_width)
         
         if y_right.shape[0]<self.ransac_right.min_samples:
-            y_pred_r = y_pred_l - self.lane_width
+            y_pred_r = cp.deepcopy(y_pred_l - self.lane_width)
+
+        # # 예측한 각 y값들의 거리 평균이 0.1보다 작을경우 차선을 강제로 분리
+        if1 , if2 = False, False
+        if np.mean(np.abs(y_pred_l - y_pred_r)) <= 0.1:
+            if1 = True if y_pred_l.all() < 0 and y_pred_r.all() < 0 else False
+            if2 = True if y_pred_l.all() > 0 and y_pred_r.all() > 0 else False
+            # 둘다 0보다 큰 값이면 차선이 왼쪽에 있다는 것
+            if if1:
+                y_pred_l = cp.deepcopy(y_pred_l + self.init_width)
+            # 둘다 0보다 작은 값이면 차선이 오른쪽에 있다는 것
+            if if2:
+                y_pred_r = cp.deepcopy(y_pred_r - self.init_width)
+
+        if self.not_left:
+            y_pred_l = cp.deepcopy(y_pred_r)
+            y_pred_r = y_pred_r - self.init_width
+        elif self.not_right:
+            y_pred_r = cp.deepcopy(y_pred_l)
+            y_pred_l = y_pred_l + self.init_width
+
+        print("lane: {:.2f} | notleft: {:s} | notright: {:s}".format(self.lane_width, str(self.not_left), str(self.not_right)))
+        print("Over 0: {:s} | Under 0: {:s}".format(str(if1), str(if2)))
 
         return x_pred, y_pred_l, y_pred_r
 
@@ -388,10 +415,10 @@ def draw_lane_img(img, leftx, lefty, rightx, righty):
     point_np = cv2.cvtColor(np.copy(img), cv2.COLOR_GRAY2BGR)
 
     for ctr in zip(leftx, lefty):
-        point_np = cv2.circle(point_np, ctr, 2, (255,0,0), -1)
+        point_np = cv2.circle(point_np, ctr, 5, (255,0,0), -1)
 
     for ctr in zip(rightx, righty):
-        point_np = cv2.circle(point_np, ctr, 2, (0,0,255), -1)
+        point_np = cv2.circle(point_np, ctr, 5, (0,0,255), -1)
 
     return point_np
 
@@ -399,7 +426,8 @@ class purePursuit:
 
     def __init__(self, look_forward_distance):
         self.is_look_forward_point = False
-        self.vehicle_length = 1
+        self.is_path = False
+        self.vehicle_length = 2
 
         self.lfd = look_forward_distance
         self.min_lfd = 0.7
@@ -407,62 +435,43 @@ class purePursuit:
 
         self.path_sub = rospy.Subscriber('/lane_path', Path, self.path_callback)
 
-        self.position_pub = rospy.Publisher('/commands/servo/position', Float64, queue_size=1)
+        self.position_pub = rospy.Publisher('/commands/servo/position2', Float64, queue_size=1)
 
         self.lpath = None
 
     def path_callback(self, msg):
-
+        if self.is_path == False:
+            self.is_path = True
         self.lpath = msg
 
-    def steering_angle_lane(self, x_pred, y_pred_l, y_pred_r):
-	y_pred = -0.5 * (y_pred_l + y_pred_r)
-
-	dis_pts = np.sqrt(np.square(x_pred) + np.square(y_pred))
-	
-	for i, pts in enumerate(dis_pts):
-
-	    if pts >= self.lfd:
-		self.is_look_forward_point = True
-		break
-
-	theta = math.atan2(y_pred[i], x_pred[i])
-	if self.is_look_forward_point:
-            steering_deg = math.atan2((2*self.vehicle_length*math.sin(theta)), self.lfd)*180/math.pi
-
-	    self.steering = np.clip(steering_deg, -17, 17)/34+0.5
-	    print(self.steering)
-	else:
-	    self.steering = 0.5304
-	    print("No found forward point")
-
-    def steering_angle(self):
+    def steering_angle(self):    
 
         self.is_look_forward_point = False
 
-        for i in self.lpath.poses:
+        if self.is_path == True:
+            for i in self.lpath.poses:
 
-            path_point = i.pose.position
+                path_point = i.pose.position
 
-            if path_point.x > 0:
+                if path_point.x > 0:
 
-                dis_pts = np.sqrt(np.square(path_point.x) + np.square(path_point.y))
+                    dis_pts = np.sqrt(np.square(path_point.x) + np.square(path_point.y))
 
-                if dis_pts >= self.lfd:
+                    if dis_pts >= self.lfd:
 
-                    self.is_look_forward_point = True
-                    break
+                        self.is_look_forward_point = True
+                        break                   
+            
+            	theta = math.atan2(path_point.y, path_point.x)
 
-        theta = math.atan2(path_point.y, path_point.x)
+            if self.is_look_forward_point:
+                steering_deg = math.atan2((2*self.vehicle_length*math.sin(theta)), self.lfd)*180/math.pi
 
-        if self.is_look_forward_point:
-            steering_deg = math.atan2((2*self.vehicle_length*math.sin(theta)), self.lfd)*180/math.pi
-
-            self.steering = np.clip(steering_deg, -17, 17)/34+0.5
-            print(self.steering)
-        else:
-            self.steering = 0.5304
-            print("No found forward point")
+                self.steering = np.clip(steering_deg, -22, 22)/44+0.5
+                print(self.steering)            
+            else:
+                self.steering = 0.5304
+                print("No found forward point")
 
     def pub_cmd(self):
 
@@ -508,7 +517,7 @@ class STOPLineEstimator:
 
 class PID_longitudinal:
 
-    def __init__(self, K=500, safe_dis=1.0, speed_max=1000):
+    def __init__(self, K=500, safe_dis=1.0, speed_max=4000):
         self.speed_max = speed_max
         self.safe_dis = safe_dis
         self.K = K
@@ -519,7 +528,7 @@ class PID_longitudinal:
         self.stopline_sub = rospy.Subscriber('/stop_line', Float64, self.stopline_callback)
         self.light_sub = rospy.Subscriber('/traffic_light', String, self.traffic_light_callback)
 
-        self.speed_pub = rospy.Publisher('/commands/motor/speed', Float64, queue_size=1)
+        self.speed_pub = rospy.Publisher('/commands/motor/speed2', Float64, queue_size=1)
 
     def stopline_callback(self, msg):
         self.sline_dis = msg.data

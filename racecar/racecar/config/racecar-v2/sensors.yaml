@@ -1,6 +1,6 @@
 
 laser_node:
-  device: /dev/ttyUSB0
+  device: /dev/ttyRplidar
 
 imu_node:
-  device: /dev/imu
+  device: /dev/ttyImu

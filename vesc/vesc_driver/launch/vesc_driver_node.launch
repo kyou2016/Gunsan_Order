@@ -1,7 +1,7 @@
 <!-- -*- mode: XML -*- -->
 <launch>
 
-  <arg name="node_name" default="vesc_driver_node" />
+  <arg name="node_name" default="vesc_driver_node2" />
 
   <!-- Optionally launch in GDB, for debugging -->
   <arg name="debug" default="false" />

@@ -16,6 +16,7 @@
     <include file="$(find racecar)/launch/includes/$(arg racecar_version)/vesc.launch.xml" >
       <arg name="racecar_version" value="$(arg racecar_version)" />
     </include>
+
   </group>
 
   <!-- start imu and laser scanner -->
